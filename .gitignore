@@ -1,3 +1,7 @@
 .venv/ 
 __pycache__/ 
 *.pyc 
+
+# PyInstaller 打包产物（可用 spec 文件重新生成）
+build/
+dist/

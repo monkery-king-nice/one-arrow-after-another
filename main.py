@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-一箭又一箭 —— 关卡流程 + 飞出动画 + 失误机制 + 阻挡碰撞动画
+一箭又一箭 —— 关卡流程 + 飞出动画 + 失误机制 + 阻挡碰撞动画 + 得分/计时/星级
 三个关卡完整流程：第1关→第2关→第3关→全部通关。
 点击可飞出的箭头后，箭头沿所指方向飞出棋盘，再从 BOARD 删除。
 点击被阻挡的箭头时，箭头会向前移动→碰撞震动→原路返回，并扣除一次失误。
+游戏还包含每关计时、累计得分、三星评价，并可用 PyInstaller 打包为 Windows exe。
 """
 
 import copy
@@ -18,6 +19,18 @@ CELL_SIZE = 60        # 每个格子的边长（像素）
 ARROW_SPEED = 5.0     # 飞出动画每帧移动的像素数（60FPS 时约 300 像素/秒）
 MAX_MISTAKES = 3      # 每关允许的最大失误次数
 
+# ---------- 得分配置 ----------
+SCORE_ARROW = 100        # 每成功飞出一个箭头 +100
+SCORE_PENALTY = 50       # 每点击一次被阻挡的箭头 -50
+SCORE_LEVEL_BONUS = 500  # 每完成一个关卡的固定奖励 +500
+TIME_BONUS_LIMIT = 30.0  # 30 秒内完成关卡才能获得时间奖励
+TIME_BONUS_PER_SEC = 20  # 每提前 1 秒额外 +20 分
+
+# ---------- 星级评价配置（只看“本关用时 + 本关失误次数”） ----------
+STAR3_TIME_LIMIT = 15.0   # 3 星：0 失误且 15 秒内完成
+STAR2_TIME_LIMIT = 30.0   # 2 星：失误不超过 1 次且 30 秒内完成
+# 其余成功通关的情况一律为 1 星（保证至少 1 星）
+
 # 被阻挡箭头动画相关配置
 BLOCKED_SPEED = 10.0      # 前进/返回速度（像素/帧，60FPS 时约 600 像素/秒）
 COLLISION_DURATION = 0.2  # 碰撞震动持续时间（秒）
@@ -31,6 +44,18 @@ COLOR_CELL_A = (255, 255, 255)   # 格子颜色 A：白
 COLOR_CELL_B = (189, 215, 238)   # 格子颜色 B：淡蓝
 COLOR_GRID_LINE = (44, 62, 80)   # 网格线：深色
 COLOR_ARROW = (192, 57, 43)      # 箭头颜色：砖红
+
+# 界面美化用的辅助颜色
+COLOR_GOLD = (255, 215, 0)             # 金色：标题、星星、棋盘外框
+COLOR_ARROW_SHADOW = (90, 30, 24)      # 箭头阴影色
+COLOR_INFOBAR = (38, 55, 72)           # 顶部信息栏背景
+COLOR_INFOBAR_EDGE = (110, 130, 150)   # 顶部信息栏边框
+COLOR_BOARD_FRAME = (44, 62, 80)       # 棋盘深色底框
+COLOR_RED = (231, 76, 60)              # 失败/错误红色
+COLOR_GREEN = (39, 174, 96)            # 绿色按钮
+COLOR_BLUE = (41, 128, 185)            # 蓝色按钮
+COLOR_WHITE = (255, 255, 255)
+COLOR_LIGHT = (236, 240, 241)
 
 # 四种箭头方向：每个方向对应 (水平分量, 垂直分量)
 # 例如 "up" 表示箭头指向上方（屏幕 y 轴向下为正，所以 y 取 -1）
@@ -98,19 +123,145 @@ game_state = "start"
 # 玩家当前剩余的失误次数，进入新关卡时重置为 MAX_MISTAKES
 mistakes_left = MAX_MISTAKES
 
+# ---------- 得分 / 计时 / 星级 数据 ----------
+score = 0                 # 整个游戏过程的累计总分（不会低于 0）
+level_score = 0           # 当前关卡已获得的分数（含本关奖励，通关时存入 level_scores）
+level_start_ticks = 0     # 当前关卡开始计时的时刻（pygame.time.get_ticks()，毫秒）
+level_elapsed = 0.0       # 当前关卡结束时定格的用时（秒）
+level_mistakes = 0        # 当前关卡已经发生的失误次数（用于星级评价）
+timer_running = False     # 当前关卡计时是否进行中
+
+# 已完成关卡的历史记录（列表下标与关卡对应，最多 3 个元素）
+level_scores = []   # 每关总得分（含通关奖励和时间奖励）
+level_times = []    # 每关用时（秒）
+level_stars = []    # 每关星级（1~3）
+
+
+def reset_game():
+    """重置整局游戏：清空总分与各关历史记录，然后加载第 1 关。
+
+    在“开始游戏”和任何“重新开始”按钮处调用；
+    进入下一关时不要调用本函数（否则会清掉累计总分）。
+    """
+    global score, level_scores, level_times, level_stars
+    score = 0
+    level_scores = []
+    level_times = []
+    level_stars = []
+    load_level(0)
+
+
+def start_level_timer():
+    """开始（或重新开始）当前关卡的计时。"""
+    global level_start_ticks, timer_running
+    level_start_ticks = pygame.time.get_ticks()
+    timer_running = True
+
+
+def stop_level_timer():
+    """停止当前关卡计时，并把用时定格到 level_elapsed。"""
+    global level_elapsed, timer_running
+    if timer_running:
+        level_elapsed = (pygame.time.get_ticks() - level_start_ticks) / 1000.0
+        timer_running = False
+
+
+def get_level_seconds():
+    """返回当前关卡的实时用时（秒）；计时停止后返回定格的用时。"""
+    if timer_running:
+        return (pygame.time.get_ticks() - level_start_ticks) / 1000.0
+    return level_elapsed
+
+
+def add_arrow_score():
+    """成功飞出一个箭头时加分：总分和本关分数各 +100。"""
+    global score, level_score
+    score += SCORE_ARROW
+    level_score += SCORE_ARROW
+
+
+def add_blocked_score():
+    """点击被阻挡箭头时扣分：各 -50，且总分不低于 0。"""
+    global score, level_score, level_mistakes
+    level_mistakes += 1
+    score = max(0, score - SCORE_PENALTY)
+    level_score -= SCORE_PENALTY  # 本关分数可以为负（通关奖励会补回来）
+
+
+def calc_time_bonus(elapsed):
+    """根据通关用时计算时间奖励：30 秒内完成，每提前 1 秒 +20 分。"""
+    if elapsed >= TIME_BONUS_LIMIT:
+        return 0
+    return int((TIME_BONUS_LIMIT - elapsed) * TIME_BONUS_PER_SEC)
+
+
+def calc_stars(elapsed, mistakes):
+    """根据本关用时和失误次数计算星级（1~3）。
+
+    3 星：0 次失误且 15 秒内完成；
+    2 星：失误不超过 1 次且 30 秒内完成；
+    1 星：其余成功通关的情况（保证通关至少 1 星）。
+    """
+    if mistakes == 0 and elapsed <= STAR3_TIME_LIMIT:
+        return 3
+    if mistakes <= 1 and elapsed <= STAR2_TIME_LIMIT:
+        return 2
+    return 1
+
+
+def complete_level():
+    """当前关卡所有箭头飞出后的结算：停止计时、算分、评星级、切换游戏状态。"""
+    global score, level_score, game_state, level_elapsed
+
+    # 1) 停止计时并定格本关用时
+    stop_level_timer()
+    elapsed = level_elapsed
+
+    # 2) 通关固定奖励 +500，以及根据用时计算的时间奖励
+    time_bonus = calc_time_bonus(elapsed)
+    score += SCORE_LEVEL_BONUS + time_bonus
+    level_score += SCORE_LEVEL_BONUS + time_bonus
+
+    # 3) 星级评价（本关失误次数 = 本关开始时的失误数 - 剩余失误数）
+    stars = calc_stars(elapsed, level_mistakes)
+
+    # 4) 记录本关成绩
+    level_scores.append(level_score)
+    level_times.append(elapsed)
+    level_stars.append(stars)
+    print(f"第 {current_level + 1} 关完成：用时 {elapsed:.1f} 秒，"
+          f"本关得分 {level_score}（时间奖励 +{time_bonus}），星级 {stars}")
+
+    # 5) 还有下一关 → 单关通关；否则 → 全部通关
+    if current_level < len(LEVELS) - 1:
+        game_state = "level_complete"
+    else:
+        total_stars = sum(level_stars)
+        print(f"全部关卡通关：总分 {score}，总评价 {total_stars}/9 星")
+        game_state = "game_complete"
+
 
 def load_level(level_index):
     """加载第 level_index 关，把对应 LEVELS 数据复制一份到 BOARD。
 
     使用 deepcopy 确保每个关卡都是独立副本，
     避免不同关卡共享同一份棋盘数据。
+    同时重置本关的失误、计时、得分等状态（不清空累计总分和历史记录）。
     """
     global BOARD, current_level, mistakes_left, blocked_arrow_animation, pending_game_over
+    global level_score, level_elapsed, level_mistakes, level_start_ticks, timer_running
     current_level = level_index
     BOARD = copy.deepcopy(LEVELS[level_index])
     mistakes_left = MAX_MISTAKES  # 进入新关卡时重置失误次数
     blocked_arrow_animation = None  # 清空可能残留的被阻挡动画
     pending_game_over = False
+
+    # 重置“本关”状态：本关分数、用时、失误、计时开关
+    level_score = 0
+    level_elapsed = 0.0
+    level_mistakes = 0
+    level_start_ticks = 0
+    timer_running = False
 
 
 def count_arrows():
@@ -189,14 +340,16 @@ def get_blocker_of_animation():
 
 
 def draw_arrow(surface, color, center_x, center_y, direction, length=36):
-    """在指定中心点画一个箭头（一条线 + 三角形箭头尖）。"""
+    """在指定中心点画一个箭头（一条线 + 三角形箭头尖）。
+
+    视觉效果：先画偏移的深色阴影，再画主体，形成简单的层次感。
+    """
     dx, dy = DIRECTIONS[direction]
     # 箭杆：从中心向“箭头所指方向”画一条线
     tail_x = center_x - dx * (length // 2)
     tail_y = center_y - dy * (length // 2)
     tip_x = center_x + dx * (length // 2)
     tip_y = center_y + dy * (length // 2)
-    pygame.draw.line(surface, color, (tail_x, tail_y), (tip_x, tip_y), 4)
 
     # 箭头尖：一个三角形。先画一个朝右的三角，再旋转到目标方向。
     size = 10
@@ -212,14 +365,29 @@ def draw_arrow(surface, color, center_x, center_y, direction, length=36):
     else:  # right
         points = [(tip_x + size, tip_y), (tip_x - size // 2, tip_y - size),
                   (tip_x - size // 2, tip_y + size)]
+
+    # 先画阴影（整体向右下偏移 2 像素），让箭头有一点立体感
+    shadow_offset = 2
+    shadow_line = [(tail_x + shadow_offset, tail_y + shadow_offset),
+                   (tip_x + shadow_offset, tip_y + shadow_offset)]
+    shadow_points = [(px + shadow_offset, py + shadow_offset) for px, py in points]
+    pygame.draw.line(surface, COLOR_ARROW_SHADOW,
+                     shadow_line[0], shadow_line[1], 5)
+    pygame.draw.polygon(surface, COLOR_ARROW_SHADOW, shadow_points)
+
+    # 再画箭头主体
+    pygame.draw.line(surface, color, (tail_x, tail_y), (tip_x, tip_y), 5)
     pygame.draw.polygon(surface, color, points)
 
 
 def build_board_rect(window):
-    """计算居中棋盘的整体矩形位置，返回 (棋盘左上角x, 棋盘左上角y, 棋盘边长)。"""
+    """计算棋盘的整体矩形位置，返回 (棋盘左上角x, 棋盘左上角y, 棋盘边长)。
+
+    水平居中；垂直方向顶部留出信息栏空间（信息栏 + 间距）。
+    """
     board_px = GRID_SIZE * CELL_SIZE
     board_x = (WINDOW_WIDTH - board_px) // 2   # 水平居中
-    board_y = (WINDOW_HEIGHT - board_px) // 2  # 垂直居中
+    board_y = 100                             # 顶部留给信息栏
     return board_x, board_y, board_px
 
 
@@ -233,8 +401,20 @@ def is_cell_flying(row, col):
 
 def draw_board(surface, board_x, board_y):
     """绘制棋盘背景格子、网格线，以及每个格子里的箭头。"""
-    # 棋盘底色
     board_px = GRID_SIZE * CELL_SIZE
+
+    # 棋盘外框：先画一层稍大的深色底框，再画一圈金色描边，增强层次感
+    frame = 8
+    pygame.draw.rect(surface, COLOR_BOARD_FRAME,
+                     (board_x - frame, board_y - frame,
+                      board_px + frame * 2, board_px + frame * 2),
+                     border_radius=6)
+    pygame.draw.rect(surface, COLOR_GOLD,
+                     (board_x - frame, board_y - frame,
+                      board_px + frame * 2, board_px + frame * 2),
+                     2, border_radius=6)
+
+    # 棋盘底色
     pygame.draw.rect(surface, COLOR_BOARD,
                      (board_x, board_y, board_px, board_px))
 
@@ -421,12 +601,24 @@ def draw_button(surface, rect, text, font, bg_color, text_color):
     """在 surface 上绘制一个带文字的按钮。
 
     rect: (x, y, width, height) 按钮矩形
+    效果：底部有简单阴影；鼠标悬停时略微变亮。
     """
-    pygame.draw.rect(surface, bg_color, rect, border_radius=6)
-    pygame.draw.rect(surface, (255, 255, 255), rect, 2, border_radius=6)
+    x, y, w, h = rect
+
+    # 阴影：在按钮下方偏右处画一个半透明深色圆角矩形
+    shadow = pygame.Surface((w, h), pygame.SRCALPHA)
+    pygame.draw.rect(shadow, (0, 0, 0, 90), (0, 0, w, h), border_radius=8)
+    surface.blit(shadow, (x + 2, y + 3))
+
+    # 鼠标悬停时把背景调亮一些
+    mouse_pos = pygame.mouse.get_pos()
+    if is_click_in_rect(mouse_pos, rect):
+        bg_color = tuple(min(255, c + 25) for c in bg_color)
+
+    pygame.draw.rect(surface, bg_color, rect, border_radius=8)
+    pygame.draw.rect(surface, (255, 255, 255), rect, 2, border_radius=8)
     text_surf = font.render(text, True, text_color)
-    text_rect = text_surf.get_rect(center=(rect[0] + rect[2] // 2,
-                                           rect[1] + rect[3] // 2))
+    text_rect = text_surf.get_rect(center=(x + w // 2, y + h // 2))
     surface.blit(text_surf, text_rect)
 
 
@@ -475,26 +667,29 @@ def main():
 
     # ---------- 字体（支持中文） ----------
     # 用字体文件直接加载，避免 SysFont 在某些 Windows 机器上枚举字体时崩溃
+    font_title = load_cjk_font(56)  # 开始界面大标题
     font_big = load_cjk_font(36)
     font_mid = load_cjk_font(24)
+    font_small = load_cjk_font(20)  # 信息栏 / 结算界面小字
+    font_star = load_cjk_font(34)   # 星级显示
+    font_deco = load_cjk_font(90)   # 开始界面背景装饰用的大号方向符号
     font_btn = load_cjk_font(28)
 
     # ---------- 按钮矩形 ----------
     # 棋盘下方居中放一个按钮（下一关 / 重新开始 共用位置）
     btn_w, btn_h = 180, 54
     btn_x = (WINDOW_WIDTH - btn_w) // 2
-    btn_y = board_y + GRID_SIZE * CELL_SIZE + 30
+    btn_y = board_y + GRID_SIZE * CELL_SIZE + 20
     action_button_rect = (btn_x, btn_y, btn_w, btn_h)
 
     # 开始界面的“开始游戏”按钮（屏幕垂直居中偏下）
-    start_btn_w, start_btn_h = 200, 60
+    start_btn_w, start_btn_h = 220, 64
     start_btn_x = (WINDOW_WIDTH - start_btn_w) // 2
-    start_btn_y = WINDOW_HEIGHT // 2 + 40
+    start_btn_y = WINDOW_HEIGHT // 2 + 90
     start_button_rect = (start_btn_x, start_btn_y, start_btn_w, start_btn_h)
 
-    # 游戏进行中随时可用的“重新开始”按钮（左上角，关卡文字下方）
-    restart_btn_w, restart_btn_h = 120, 38
-    restart_button_rect = (20, 56, restart_btn_w, restart_btn_h)
+    # 游戏进行中随时可用的“重新开始”按钮（放在顶部信息栏右侧）
+    restart_button_rect = (736, 26, 132, 44)
 
     # 启动时进入开始界面（不直接进入游戏）
     load_level(0)
@@ -515,7 +710,8 @@ def main():
                     # 开始界面：只响应“开始游戏”按钮，点击棋盘不产生任何操作
                     if is_click_in_rect(event.pos, start_button_rect):
                         flying_arrows.clear()       # 清空可能残留的飞出箭头
-                        load_level(0)               # 从第1关全新开始（重置失误等）
+                        reset_game()                # 清空总分/历史，从第1关全新开始
+                        start_level_timer()         # 开始本关计时
                         game_state = "playing"
                         print("开始游戏，进入第 1 关")
 
@@ -523,7 +719,8 @@ def main():
                     # 游戏中：优先处理“重新开始”按钮（随时可用，不受动画限制）
                     if is_click_in_rect(event.pos, restart_button_rect):
                         flying_arrows.clear()        # 清空飞出箭头
-                        load_level(0)                # 回到第1关并重置失误
+                        reset_game()                 # 总分清零，回到第1关
+                        start_level_timer()          # 重新计时
                         game_state = "playing"
                         print("重新开始，回到第 1 关")
                     else:
@@ -559,7 +756,8 @@ def main():
                                             # 箭头被阻挡：启动“前进→碰撞→震动→返回”动画
                                             # 一次点击只扣一次失误（在点击时扣，动画过程中不重复扣）
                                             mistakes_left -= 1
-                                            print(f"箭头被阻挡，剩余失误次数：{mistakes_left}")
+                                            add_blocked_score()  # 得分 -50，并记录本关失误数
+                                            print(f"箭头被阻挡，剩余失误次数：{mistakes_left}，当前得分：{score}")
 
                                             block = find_blocking_arrow(row, col)
                                             # 计算原始中心与碰撞目标位置
@@ -618,14 +816,17 @@ def main():
                         next_level = current_level + 1
                         # 防御：确保不会进入不存在的第 4 关
                         if next_level < len(LEVELS):
-                            load_level(next_level)
+                            load_level(next_level)     # 只加载下一关，保留累计总分
+                            start_level_timer()        # 下一关重新计时
                             game_state = "playing"
                             print(f"进入第 {current_level + 1} 关")
 
                 elif game_state == "game_complete":
                     # 全部通关：只响应"重新开始"按钮
                     if is_click_in_rect(event.pos, action_button_rect):
-                        load_level(0)
+                        flying_arrows.clear()
+                        reset_game()            # 清空总分与各关记录
+                        start_level_timer()
                         game_state = "playing"
                         print("重新开始游戏")
 
@@ -633,7 +834,8 @@ def main():
                     # 游戏失败：只响应"重新开始"按钮
                     if is_click_in_rect(event.pos, action_button_rect):
                         flying_arrows.clear()  # 清空残留的飞出箭头
-                        load_level(0)
+                        reset_game()           # 清空总分与各关记录
+                        start_level_timer()
                         game_state = "playing"
                         print("重新开始游戏")
 
@@ -646,13 +848,11 @@ def main():
             if is_flying_arrow_off_board(fa, board_x, board_y):
                 # 完全飞出棋盘，从 BOARD 中删除该箭头
                 BOARD[fa["row"]][fa["col"]] = ""
-                print("箭头已飞出棋盘")
-                # 飞出后检查本关是否完成
+                add_arrow_score()  # 成功飞出 +100
+                print(f"箭头已飞出棋盘，当前得分：{score}")
+                # 飞出后检查本关是否完成（结算由 complete_level 统一处理）
                 if game_state == "playing" and count_arrows() == 0:
-                    if current_level < len(LEVELS) - 1:
-                        game_state = "level_complete"
-                    else:
-                        game_state = "game_complete"
+                    complete_level()
             else:
                 still_flying.append(fa)
         # 原地更新列表，避免重新赋值触发全局变量问题
@@ -721,27 +921,47 @@ def main():
                     # 如果本次失误耗尽了次数，此时才真正进入 game_over
                     if pending_game_over:
                         pending_game_over = False
+                        stop_level_timer()  # 失败时停止本关计时
                         game_state = "game_over"
-                        print("游戏失败")
+                        print(f"游戏失败，本次得分：{score}，已完成 {current_level} 关")
 
         # ---------- 绘制 ----------
         window.fill(COLOR_BG)
 
         if game_state == "start":
-            # ===== 开始界面：不绘制棋盘和状态栏 =====
+            # ===== 开始界面：不绘制棋盘和信息栏 =====
+            # 背景装饰：几个半透明圆形
+            deco = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+            for cx, cy, r in [(120, 120, 70), (780, 140, 50), (100, 560, 55),
+                              (800, 580, 75), (450, 90, 35)]:
+                pygame.draw.circle(deco, (255, 255, 255, 16), (cx, cy), r)
+            window.blit(deco, (0, 0))
+
+            # 半透明大号方向符号，呼应“箭头”主题
+            for ch, cx, cy in [("→", 140, 250), ("←", 760, 280),
+                               ("↓", 170, 460), ("↑", 730, 470)]:
+                sym = font_deco.render(ch, True, COLOR_GOLD)
+                sym.set_alpha(35)
+                window.blit(sym, sym.get_rect(center=(cx, cy)))
+
             # 标题
-            title_surf = font_big.render("一箭又一箭", True, (255, 215, 0))
-            title_rect = title_surf.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 80))
+            title_surf = font_title.render("一箭又一箭", True, COLOR_GOLD)
+            title_rect = title_surf.get_rect(center=(WINDOW_WIDTH // 2, 220))
             window.blit(title_surf, title_rect)
 
+            # 副标题
+            subtitle_surf = font_mid.render("观察方向，寻找出口", True, COLOR_WHITE)
+            subtitle_rect = subtitle_surf.get_rect(center=(WINDOW_WIDTH // 2, 290))
+            window.blit(subtitle_surf, subtitle_rect)
+
             # 游戏说明
-            tip_surf = font_mid.render("点击箭头，让所有箭头飞出棋盘！", True, (255, 255, 255))
-            tip_rect = tip_surf.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 20))
+            tip_surf = font_small.render("点击箭头，让所有箭头飞出棋盘！", True, COLOR_LIGHT)
+            tip_rect = tip_surf.get_rect(center=(WINDOW_WIDTH // 2, 330))
             window.blit(tip_surf, tip_rect)
 
             # 开始游戏按钮
             draw_button(window, start_button_rect, "开始游戏", font_btn,
-                        (39, 174, 96), (255, 255, 255))
+                        COLOR_GREEN, COLOR_WHITE)
 
         else:
             # ===== 游戏中 / 通关 / 失败 界面 =====
@@ -779,64 +999,103 @@ def main():
                         draw_arrow(window, COLOR_ARROW,
                                    int(bx + b_shake_x), int(by + b_shake_y), blocker_dir)
 
-            # 2) 顶部状态栏：当前关卡 + 剩余箭头
-            level_text = font_mid.render(f"当前关卡：第 {current_level + 1} 关", True, (255, 255, 255))
-            window.blit(level_text, (20, 20))
+            # 2) 顶部信息栏：关卡 / 得分 / 用时 / 剩余箭头 / 剩余失误
+            info_rect = (16, 12, 868, 72)
+            pygame.draw.rect(window, COLOR_INFOBAR, info_rect, border_radius=10)
+            pygame.draw.rect(window, COLOR_INFOBAR_EDGE, info_rect, 2, border_radius=10)
 
-            arrow_text = font_mid.render(f"剩余箭头：{count_arrows()}", True, (255, 255, 255))
-            arrow_rect = arrow_text.get_rect(topright=(WINDOW_WIDTH - 20, 20))
-            window.blit(arrow_text, arrow_rect)
+            def blit_info(text, x, color=COLOR_WHITE, font=font_small):
+                """在信息栏内按左对齐绘制一行文字（垂直居中）。"""
+                surf = font.render(text, True, color)
+                window.blit(surf, surf.get_rect(x=x, centery=48))
 
-            # 剩余失误次数
-            mistake_text = font_mid.render(f"剩余失误：{mistakes_left}", True, (255, 255, 255))
-            mistake_rect = mistake_text.get_rect(topright=(WINDOW_WIDTH - 20, 50))
-            window.blit(mistake_text, mistake_rect)
+            blit_info(f"第 {current_level + 1} 关", 34, COLOR_GOLD, font_mid)
+            blit_info(f"得分：{score}", 150)
+            time_surf = font_small.render(f"用时：{get_level_seconds():.1f} 秒", True, COLOR_WHITE)
+            window.blit(time_surf, time_surf.get_rect(center=(430, 48)))
+            blit_info(f"剩余箭头：{count_arrows()}", 520)
+            mistake_color = COLOR_WHITE if mistakes_left > 0 else COLOR_RED
+            blit_info(f"失误：{mistakes_left}/{MAX_MISTAKES}", 640, mistake_color)
 
-            # 随时可用的“重新开始”按钮（左上角，关卡文字下方）
-            draw_button(window, restart_button_rect, "重新开始", font_mid,
-                        (192, 57, 43), (255, 255, 255))
+            # 信息栏内随时可用的“重新开始”按钮
+            draw_button(window, restart_button_rect, "重新开始", font_small,
+                        (192, 57, 43), COLOR_WHITE)
 
-            # 3) 通关 / 全部通关的覆盖层与按钮
+            # 3) 通关 / 全部通关 / 失败 的覆盖层与按钮
             if game_state == "level_complete":
-                # 半透明遮罩
-                overlay = pygame.Surface((GRID_SIZE * CELL_SIZE, GRID_SIZE * CELL_SIZE), pygame.SRCALPHA)
-                overlay.fill((0, 0, 0, 160))
-                window.blit(overlay, (board_x, board_y))
+                # 全屏半透明遮罩
+                overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 170))
+                window.blit(overlay, (0, 0))
 
-                msg = f"第 {current_level + 1} 关通关！"
-                msg_surf = font_big.render(msg, True, (255, 215, 0))
-                msg_rect = msg_surf.get_rect(center=(WINDOW_WIDTH // 2, board_y - 30))
-                window.blit(msg_surf, msg_rect)
+                cx = WINDOW_WIDTH // 2
+                last_time = level_times[-1]
+                last_score = level_scores[-1]
+                last_stars = level_stars[-1]
+                time_bonus = calc_time_bonus(last_time)
+                star_text = "★" * last_stars + "☆" * (3 - last_stars)
+
+                def center_line(surf_font, text, color, y):
+                    s = surf_font.render(text, True, color)
+                    window.blit(s, s.get_rect(center=(cx, y)))
+
+                center_line(font_big, f"第 {current_level + 1} 关完成！", COLOR_GOLD, board_y + 60)
+                center_line(font_star, star_text, COLOR_GOLD, board_y + 125)
+                center_line(font_mid, f"本关得分：{last_score}", COLOR_WHITE, board_y + 190)
+                center_line(font_mid, f"本关用时：{last_time:.1f} 秒", COLOR_WHITE, board_y + 230)
+                center_line(font_small, f"（含通关奖励 +{SCORE_LEVEL_BONUS}，时间奖励 +{time_bonus}）",
+                            COLOR_LIGHT, board_y + 268)
 
                 draw_button(window, action_button_rect, "下一关", font_btn,
-                            (39, 174, 96), (255, 255, 255))
+                            COLOR_GREEN, COLOR_WHITE)
 
             elif game_state == "game_complete":
-                overlay = pygame.Surface((GRID_SIZE * CELL_SIZE, GRID_SIZE * CELL_SIZE), pygame.SRCALPHA)
-                overlay.fill((0, 0, 0, 160))
-                window.blit(overlay, (board_x, board_y))
+                overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 170))
+                window.blit(overlay, (0, 0))
 
-                msg = "恭喜！全部关卡通关！"
-                msg_surf = font_big.render(msg, True, (255, 215, 0))
-                msg_rect = msg_surf.get_rect(center=(WINDOW_WIDTH // 2, board_y - 30))
-                window.blit(msg_surf, msg_rect)
+                cx = WINDOW_WIDTH // 2
+
+                def center_line(surf_font, text, color, y):
+                    s = surf_font.render(text, True, color)
+                    window.blit(s, s.get_rect(center=(cx, y)))
+
+                center_line(font_title, "恭喜通关！", COLOR_GOLD, 150)
+                # 三个关卡各自的星级
+                for i in range(len(LEVELS)):
+                    stars = level_stars[i] if i < len(level_stars) else 0
+                    star_text = "★" * stars + "☆" * (3 - stars)
+                    center_line(font_mid,
+                                f"第 {i + 1} 关：{star_text}", COLOR_WHITE, 225 + i * 44)
+                total_stars = sum(level_stars)
+                center_line(font_mid, f"总评价：{total_stars}/9 星", COLOR_GOLD, 365)
+                center_line(font_mid, f"总分：{score}", COLOR_WHITE, 410)
+                center_line(font_mid, f"总用时：{sum(level_times):.1f} 秒",
+                            COLOR_WHITE, 450)
 
                 draw_button(window, action_button_rect, "重新开始", font_btn,
-                            (41, 128, 185), (255, 255, 255))
+                            COLOR_BLUE, COLOR_WHITE)
 
             elif game_state == "game_over":
-                # 失败界面：半透明遮罩 + 提示文字 + 重新开始按钮
-                overlay = pygame.Surface((GRID_SIZE * CELL_SIZE, GRID_SIZE * CELL_SIZE), pygame.SRCALPHA)
-                overlay.fill((0, 0, 0, 160))
-                window.blit(overlay, (board_x, board_y))
+                # 失败界面：全屏半透明遮罩 + 提示信息 + 重新开始按钮
+                overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 170))
+                window.blit(overlay, (0, 0))
 
-                msg = "游戏失败"
-                msg_surf = font_big.render(msg, True, (231, 76, 60))
-                msg_rect = msg_surf.get_rect(center=(WINDOW_WIDTH // 2, board_y - 30))
-                window.blit(msg_surf, msg_rect)
+                cx = WINDOW_WIDTH // 2
+
+                def center_line(surf_font, text, color, y):
+                    s = surf_font.render(text, True, color)
+                    window.blit(s, s.get_rect(center=(cx, y)))
+
+                center_line(font_title, "挑战失败", COLOR_RED, 235)
+                center_line(font_mid, f"本次得分：{score}", COLOR_WHITE, 325)
+                center_line(font_mid, f"已完成关卡：{current_level} / {len(LEVELS)}",
+                            COLOR_WHITE, 370)
+                center_line(font_small, "不要灰心，再试一次吧！", COLOR_LIGHT, 425)
 
                 draw_button(window, action_button_rect, "重新开始", font_btn,
-                            (192, 57, 43), (255, 255, 255))
+                            (192, 57, 43), COLOR_WHITE)
 
         pygame.display.flip()
 
