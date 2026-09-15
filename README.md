@@ -78,9 +78,35 @@
 
 ![游戏界面](images/game.png)
 
-游戏结果界面（通关 / 失败）：
+全部三关通关后的结算界面（显示三关星级、总评价、总分和总用时）：
 
-![游戏结果界面](images/result.png)
+![游戏通关界面](images/result.png)
+
+失误次数耗尽后的失败界面（显示本次得分和已完成关卡数）：
+
+![游戏失败界面](images/failure.png)
+
+### 演示 GIF（推荐补充）
+
+静态截图只能展示某一瞬间，GIF 或短视频可以更清楚地呈现游戏的核心动画：箭头飞出、碰撞震动、原路返回、计时与得分实时变化等。推荐录制一段 3~8 秒的演示，包含：
+
+1. 从开始界面点「开始游戏」进入第 1 关
+2. 点击一个可飞出的箭头，展示飞出动画和得分 +100
+3. 再点击一个被阻挡的箭头，展示「前进 → 碰撞 → 返回」动画和扣分 / 失误 +1
+
+录制工具推荐（均为免费，适合 Windows）：
+
+| 工具 | 说明 |
+|---|---|
+| **LICEcap** | 最推荐。体积小、操作简单，选中区域后直接录制为 GIF，自带文字提示和帧率调节，GitHub 上很多小游戏都用它 |
+| **OBS Studio** | 专业录屏软件，支持 MP4 等多种格式；录完后可用 [ezgif.com](https://ezgif.com/video-to-gif) 在线转 GIF |
+| **ScreenToGif** | 功能比 LICEcap 稍强，同样是免费开源，内置编辑器可以删掉多余帧 |
+
+录制后建议保存为 `images/demo.gif`，并在上文游戏界面处追加一行引用：
+
+```markdown
+![演示动画](images/demo.gif)
+```
 
 ## 六、项目结构
 
@@ -89,9 +115,10 @@ one-arrow-after-another/
 ├── main.py            # 游戏主程序（包含全部游戏逻辑与界面绘制）
 ├── 一箭又一箭.spec     # PyInstaller 打包配置（生成单文件 exe）
 ├── images/            # README 使用的游戏界面截图（非游戏运行资源）
-│   ├── start.png
-│   ├── game.png
-│   └── result.png
+│   ├── start.png      # 开始界面
+│   ├── game.png       # 游戏进行界面
+│   ├── result.png     # 全部通关结算界面
+│   └── failure.png    # 挑战失败界面
 ├── AIGC记录.md         # AIGC 工具使用过程记录
 ├── .gitignore         # Git 忽略文件配置
 └── README.md          # 项目说明文档
